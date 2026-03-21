@@ -1,0 +1,38 @@
+# 環境設定（含 API 金鑰、憑證密碼）
+.env
+.env.*
+
+# 永豐金憑證（含私鑰，絕對不可上傳）
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+
+# SQLite 資料庫（個人帳務資料）
+*.db
+*.db-shm
+*.db-wal
+
+# Shioaji log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# uv
+.python-version
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
