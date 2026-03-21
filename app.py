@@ -1,21 +1,240 @@
 import os
 import sys
 from datetime import date, datetime
+from pathlib import Path
 
-from dotenv import load_dotenv
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from dotenv import load_dotenv, set_key
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
-    QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea,
-    QSizePolicy, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
-    QWidget,
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 import shioaji as sj
 
 from core import fetch_all_accounts
 from db import list_account_ids, load_snapshots, save_snapshot
 
-load_dotenv()
+ENV_PATH = Path(__file__).parent / ".env"
+
+load_dotenv(ENV_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Dialogs
+# ---------------------------------------------------------------------------
+
+def _bordered_dialog(dlg: "QDialog") -> QFrame:
+    """在 dialog 內建立帶黑框的容器 QFrame，回傳供填入內容用。"""
+    outer = QVBoxLayout(dlg)
+    outer.setContentsMargins(0, 0, 0, 0)
+    frame = QFrame()
+    frame.setFrameShape(QFrame.Shape.Box)
+    frame.setLineWidth(2)
+    frame.setStyleSheet("QFrame { border: 2px solid #2c2c2c; border-radius: 4px; }")
+    outer.addWidget(frame)
+    return frame
+
+
+class _ApiTestWorker(QThread):
+    """背景執行 Shioaji 登入（或登入＋啟用憑證）測試。"""
+    result = pyqtSignal(bool, str)  # success, message
+
+    def __init__(self, api_key: str, secret_key: str,
+                 ca_path: str = "", ca_passwd: str = "") -> None:
+        super().__init__()
+        self._api_key    = api_key
+        self._secret_key = secret_key
+        self._ca_path    = ca_path
+        self._ca_passwd  = ca_passwd
+
+    def run(self) -> None:
+        api = sj.Shioaji()
+        try:
+            api.login(api_key=self._api_key, secret_key=self._secret_key)
+            if self._ca_path:
+                api.activate_ca(ca_path=self._ca_path, ca_passwd=self._ca_passwd)
+            self.result.emit(True, "成功")
+        except Exception as e:
+            self.result.emit(False, str(e))
+        finally:
+            try:
+                api.logout()
+            except Exception:
+                pass
+
+
+class AccountSettingsDialog(QDialog):
+    """讓使用者編輯 .env 中的帳戶設定並儲存。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("帳戶設定")
+        self.setMinimumWidth(460)
+        self._worker: _ApiTestWorker | None = None
+
+        frame = _bordered_dialog(self)
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(12, 12, 12, 12)
+        inner.setSpacing(10)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        self._inputs: dict[str, QLineEdit] = {}
+
+        # API Key（明文顯示）
+        self._inputs["API_KEY"] = QLineEdit(os.getenv("API_KEY", ""))
+        form.addRow("API Key：", self._inputs["API_KEY"])
+
+        # Secret Key（明文顯示）
+        self._inputs["SECRET_KEY"] = QLineEdit(os.getenv("SECRET_KEY", ""))
+        form.addRow("Secret Key：", self._inputs["SECRET_KEY"])
+
+        # 憑證路徑 + 瀏覽按鈕
+        ca_path_row = QHBoxLayout()
+        self._inputs["YOUR_CA_PATH"] = QLineEdit(os.getenv("YOUR_CA_PATH", ""))
+        browse_btn = QPushButton("瀏覽...")
+        browse_btn.setFixedWidth(64)
+        browse_btn.clicked.connect(self._browse_ca)
+        ca_path_row.addWidget(self._inputs["YOUR_CA_PATH"])
+        ca_path_row.addWidget(browse_btn)
+        form.addRow("憑證路徑：", ca_path_row)
+
+        # 憑證密碼 + 顯示/隱藏切換按鈕
+        ca_pass_row = QHBoxLayout()
+        ca_pass_edit = QLineEdit(os.getenv("YOUR_CA_PASS", ""))
+        ca_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._inputs["YOUR_CA_PASS"] = ca_pass_edit
+        toggle_btn = QPushButton("顯示")
+        toggle_btn.setFixedWidth(64)
+        toggle_btn.setCheckable(True)
+        toggle_btn.toggled.connect(self._toggle_ca_pass)
+        ca_pass_row.addWidget(ca_pass_edit)
+        ca_pass_row.addWidget(toggle_btn)
+        form.addRow("憑證密碼：", ca_pass_row)
+
+        inner.addLayout(form)
+
+        # 測試按鈕列
+        test_row = QHBoxLayout()
+        self._test_key_btn = QPushButton("測試登入 Key")
+        self._test_ca_btn  = QPushButton("測試憑證")
+        self._test_key_btn.clicked.connect(self._test_login_key)
+        self._test_ca_btn.clicked.connect(self._test_ca)
+        test_row.addWidget(self._test_key_btn)
+        test_row.addWidget(self._test_ca_btn)
+        test_row.addStretch()
+        inner.addLayout(test_row)
+
+        # 測試結果標籤
+        self._test_status = QLabel("")
+        self._test_status.setWordWrap(True)
+        inner.addWidget(self._test_status)
+
+        # 儲存 / 取消
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        inner.addWidget(buttons)
+
+    # ------------------------------------------------------------------
+
+    def _browse_ca(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "選擇憑證檔案", "", "憑證檔案 (*.pfx *.p12 *.pem *.cer);;所有檔案 (*)"
+        )
+        if path:
+            self._inputs["YOUR_CA_PATH"].setText(path)
+
+    def _toggle_ca_pass(self, checked: bool) -> None:
+        edit = self._inputs["YOUR_CA_PASS"]
+        btn = self.sender()
+        if checked:
+            edit.setEchoMode(QLineEdit.EchoMode.Normal)
+            btn.setText("隱藏")
+        else:
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            btn.setText("顯示")
+
+    def _set_testing(self, testing: bool) -> None:
+        self._test_key_btn.setEnabled(not testing)
+        self._test_ca_btn.setEnabled(not testing)
+        if testing:
+            self._test_status.setStyleSheet("")
+            self._test_status.setText("測試中，請稍候...")
+
+    def _test_login_key(self) -> None:
+        api_key    = self._inputs["API_KEY"].text().strip()
+        secret_key = self._inputs["SECRET_KEY"].text().strip()
+        if not api_key or not secret_key:
+            self._show_status(False, "請先填寫 API Key 及 Secret Key")
+            return
+        self._set_testing(True)
+        self._worker = _ApiTestWorker(api_key, secret_key)
+        self._worker.result.connect(lambda ok, msg: self._show_status(ok, f"登入測試：{msg}"))
+        self._worker.start()
+
+    def _test_ca(self) -> None:
+        api_key    = self._inputs["API_KEY"].text().strip()
+        secret_key = self._inputs["SECRET_KEY"].text().strip()
+        ca_path    = self._inputs["YOUR_CA_PATH"].text().strip()
+        ca_passwd  = self._inputs["YOUR_CA_PASS"].text().strip()
+        if not api_key or not secret_key:
+            self._show_status(False, "請先填寫 API Key 及 Secret Key")
+            return
+        if not ca_path or not ca_passwd:
+            self._show_status(False, "請先填寫憑證路徑及憑證密碼")
+            return
+        self._set_testing(True)
+        self._worker = _ApiTestWorker(api_key, secret_key, ca_path, ca_passwd)
+        self._worker.result.connect(lambda ok, msg: self._show_status(ok, f"憑證測試：{msg}"))
+        self._worker.start()
+
+    def _show_status(self, success: bool, msg: str) -> None:
+        color = "#1a7f37" if success else "#c0392b"
+        self._test_status.setStyleSheet(f"color: {color}; font-weight: bold;")
+        self._test_status.setText(msg)
+        self._set_testing(False)
+
+    def _save(self) -> None:
+        for key, edit in self._inputs.items():
+            set_key(str(ENV_PATH), key, edit.text())
+        load_dotenv(ENV_PATH, override=True)
+        self.accept()
+
+
+class AboutDialog(QDialog):
+    """顯示程式版本與 Shioaji 版本。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("關於")
+        self.setFixedSize(300, 160)
+
+        frame = _bordered_dialog(self)
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(20, 20, 20, 20)
+        inner.setSpacing(8)
+
+        title = QLabel("<b>永豐金帳戶管理員</b>")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        inner.addWidget(title)
+
+        app_version = "0.1.0"
+        sj_version  = getattr(sj, "__version__", "未知")
+        info = QLabel(f"版本：{app_version}\nShioaji 版本：{sj_version}")
+        info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        inner.addWidget(info)
+
+        inner.addStretch()
+
+        btn = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        btn.accepted.connect(self.accept)
+        inner.addWidget(btn)
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +308,12 @@ class FetchWorker(QThread):
 # Main window
 # ---------------------------------------------------------------------------
 
+def _check_env() -> list[str]:
+    """回傳尚未設定的必要欄位名稱清單。"""
+    required = {"API_KEY": "API Key", "SECRET_KEY": "Secret Key"}
+    return [label for key, label in required.items() if not os.getenv(key, "").strip()]
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -98,6 +323,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._refresh_account_dropdown()
         self._load_history()
+        QTimer.singleShot(0, self._check_settings_on_start)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -127,7 +353,41 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_history_tab(),  "歷史資料")
         root.addWidget(tabs)
 
+        self._setup_menu()
         self.statusBar().showMessage("就緒")
+
+    def _check_settings_on_start(self) -> None:
+        missing = _check_env()
+        if not ENV_PATH.exists():
+            msg = "找不到 .env 設定檔，請先完成帳戶設定。"
+        elif missing:
+            msg = f"以下必要欄位尚未設定：{', '.join(missing)}\n請先完成帳戶設定。"
+        else:
+            return
+        ret = QMessageBox.warning(
+            self, "帳戶設定不完整", msg,
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Ok,
+        )
+        if ret == QMessageBox.StandardButton.Ok:
+            self._show_account_settings()
+
+    def _setup_menu(self) -> None:
+        menu_bar = self.menuBar()
+
+        settings_action = menu_bar.addAction("帳戶設定")
+        settings_action.triggered.connect(self._show_account_settings)
+
+        about_action = menu_bar.addAction("關於")
+        about_action.triggered.connect(self._show_about)
+
+    def _show_account_settings(self) -> None:
+        dlg = AccountSettingsDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage("帳戶設定已儲存")
+
+    def _show_about(self) -> None:
+        AboutDialog(self).exec()
 
     def _build_realtime_tab(self) -> QWidget:
         scroll = QScrollArea()
