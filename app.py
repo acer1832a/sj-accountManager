@@ -6,15 +6,15 @@ from pathlib import Path
 from dotenv import load_dotenv, set_key
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+    QMainWindow, QMessageBox, QPushButton, QScrollArea,
     QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 import shioaji as sj
 
 from core import fetch_all_accounts
-from db import list_account_ids, load_snapshots, save_snapshot
+from db import list_account_ids, load_snapshots, reconcile_previous_snapshot, save_snapshot
 
 ENV_PATH = Path(__file__).parent / ".env"
 
@@ -24,6 +24,16 @@ load_dotenv(ENV_PATH)
 # ---------------------------------------------------------------------------
 # Dialogs
 # ---------------------------------------------------------------------------
+
+def _mask_account_id(acc_id: str) -> str:
+    """若 HIDE_ACCOUNT_INFO=true，將 acc_id 中 '-' 之後的部分以星號取代。"""
+    if os.getenv("HIDE_ACCOUNT_INFO", "false").lower() != "true":
+        return acc_id
+    if "-" in acc_id:
+        prefix, suffix = acc_id.split("-", 1)
+        return f"{prefix}-{'*' * len(suffix)}"
+    return acc_id
+
 
 def _bordered_dialog(dlg: "QDialog") -> QFrame:
     """在 dialog 內建立帶黑框的容器 QFrame，回傳供填入內容用。"""
@@ -73,6 +83,8 @@ class AccountSettingsDialog(QDialog):
         self.setWindowTitle("帳戶設定")
         self.setMinimumWidth(460)
         self._worker: _ApiTestWorker | None = None
+        self._orig_api_key    = os.getenv("API_KEY", "")
+        self._orig_secret_key = os.getenv("SECRET_KEY", "")
 
         frame = _bordered_dialog(self)
         inner = QVBoxLayout(frame)
@@ -133,13 +145,13 @@ class AccountSettingsDialog(QDialog):
         inner.addWidget(self._test_status)
 
         # 儲存 / 取消
-        buttons = QDialogButtonBox(
+        self._button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save |
             QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
-        inner.addWidget(buttons)
+        self._button_box.accepted.connect(self._save)
+        self._button_box.rejected.connect(self.reject)
+        inner.addWidget(self._button_box)
 
     # ------------------------------------------------------------------
 
@@ -163,6 +175,7 @@ class AccountSettingsDialog(QDialog):
     def _set_testing(self, testing: bool) -> None:
         self._test_key_btn.setEnabled(not testing)
         self._test_ca_btn.setEnabled(not testing)
+        self._button_box.setEnabled(not testing)
         if testing:
             self._test_status.setStyleSheet("")
             self._test_status.setText("測試中，請稍候...")
@@ -201,8 +214,90 @@ class AccountSettingsDialog(QDialog):
         self._set_testing(False)
 
     def _save(self) -> None:
+        api_key    = self._inputs["API_KEY"].text().strip()
+        secret_key = self._inputs["SECRET_KEY"].text().strip()
+        if not api_key or not secret_key:
+            QMessageBox.warning(
+                self, "欄位未填寫",
+                "API Key 及 Secret Key 為必填欄位，請輸入後再儲存。"
+            )
+            return
+        keys_changed = (api_key != self._orig_api_key or
+                        secret_key != self._orig_secret_key)
+        if keys_changed:
+            self._set_testing(True)
+            self._worker = _ApiTestWorker(api_key, secret_key)
+            self._worker.result.connect(self._on_save_login_result)
+            self._worker.start()
+        else:
+            self._do_save()
+
+    def _on_save_login_result(self, success: bool, msg: str) -> None:
+        self._set_testing(False)
+        if not success:
+            self._show_status(False, f"登入失敗，設定未儲存：{msg}")
+            QMessageBox.critical(
+                self, "登入失敗",
+                f"所輸入的 Key 無法執行登入動作，設定不會儲存。\n\n原因：{msg}"
+            )
+            return
+        self._do_save()
+
+    def _do_save(self) -> None:
         for key, edit in self._inputs.items():
             set_key(str(ENV_PATH), key, edit.text())
+        load_dotenv(ENV_PATH, override=True)
+        self.accept()
+
+
+class SystemSettingsDialog(QDialog):
+    """系統行為設定（帳號遮罩、自動更新等）。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("系統設定")
+        self.setMinimumWidth(340)
+
+        frame = _bordered_dialog(self)
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(16, 16, 16, 16)
+        inner.setSpacing(12)
+
+        self._hide_account_chk = QCheckBox("隱藏帳號資訊（「-」號後以星號顯示）")
+        self._hide_account_chk.setChecked(
+            os.getenv("HIDE_ACCOUNT_INFO", "false").lower() == "true"
+        )
+        inner.addWidget(self._hide_account_chk)
+
+        self._auto_refresh_chk = QCheckBox("程式執行時自動更新帳戶資訊")
+        self._auto_refresh_chk.setChecked(
+            os.getenv("AUTO_REFRESH", "false").lower() == "true"
+        )
+        inner.addWidget(self._auto_refresh_chk)
+
+        self._show_positions_chk = QCheckBox("顯示股票庫存頁籤")
+        self._show_positions_chk.setChecked(
+            os.getenv("SHOW_STOCK_POSITIONS", "false").lower() == "true"
+        )
+        inner.addWidget(self._show_positions_chk)
+
+        inner.addStretch()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        inner.addWidget(buttons)
+
+    def _save(self) -> None:
+        set_key(str(ENV_PATH), "HIDE_ACCOUNT_INFO",
+                "true" if self._hide_account_chk.isChecked() else "false")
+        set_key(str(ENV_PATH), "AUTO_REFRESH",
+                "true" if self._auto_refresh_chk.isChecked() else "false")
+        set_key(str(ENV_PATH), "SHOW_STOCK_POSITIONS",
+                "true" if self._show_positions_chk.isChecked() else "false")
         load_dotenv(ENV_PATH, override=True)
         self.accept()
 
@@ -224,7 +319,7 @@ class AboutDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         inner.addWidget(title)
 
-        app_version = "0.1.0"
+        app_version = "0.3.0"
         sj_version  = getattr(sj, "__version__", "未知")
         info = QLabel(f"版本：{app_version}\nShioaji 版本：{sj_version}")
         info.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -242,25 +337,35 @@ class AboutDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 def _save_all_snapshots(data: dict) -> None:
-    today = str(date.today())
-    for sa in data["stock_accounts"]:
+    stock_accs = data["stock_accounts"]
+    # 取第一個股票帳戶的交易日作為共用快照日期，沒有則 fallback 到今天
+    snapshot_date = (
+        stock_accs[0]["snapshot_date"] if stock_accs else str(date.today())
+    )
+    for sa in stock_accs:
         save_snapshot({
-            "date": today,
+            "date": sa["snapshot_date"],
             "account_id": sa["account_id"],
             "cash_balance": sa["cash_balance"],
-            "total_settlement": sa["total_settlement"],
+            "settlement_t1": sa["settlement_t1"],
+            "settlement_t2": sa["settlement_t2"],
             "cash_level": sa["cash_level"],
             "stock_market_value": sa["stock_market_value"],
             "total_assets": sa["total_assets"],
             "cash_ratio": sa["cash_ratio"],
             "futopt_equity": None,
         })
+        reconcile_previous_snapshot(
+            sa["account_id"], sa["snapshot_date"],
+            sa["settlement_t0"], sa["settlement_t1"],
+        )
     for fa in data["futopt_accounts"]:
         save_snapshot({
-            "date": today,
+            "date": snapshot_date,
             "account_id": fa["account_id"],
             "cash_balance": None,
-            "total_settlement": None,
+            "settlement_t1": None,
+            "settlement_t2": None,
             "cash_level": None,
             "stock_market_value": None,
             "total_assets": None,
@@ -320,6 +425,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("帳戶管理員")
         self.resize(960, 720)
         self._worker: FetchWorker | None = None
+        self._last_data: dict | None = None
         self._setup_ui()
         self._refresh_account_dropdown()
         self._load_history()
@@ -348,10 +454,13 @@ class MainWindow(QMainWindow):
         root.addLayout(toolbar)
 
         # tabs
-        tabs = QTabWidget()
-        tabs.addTab(self._build_realtime_tab(), "即時狀態")
-        tabs.addTab(self._build_history_tab(),  "歷史資料")
-        root.addWidget(tabs)
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._build_realtime_tab(),   "即時狀態")
+        self._positions_tab_index = 1
+        self._tabs.addTab(self._build_positions_tab(),  "股票庫存")
+        self._tabs.addTab(self._build_history_tab(),    "歷史資料")
+        self._update_positions_tab_visibility()
+        root.addWidget(self._tabs)
 
         self._setup_menu()
         self.statusBar().showMessage("就緒")
@@ -363,6 +472,7 @@ class MainWindow(QMainWindow):
         elif missing:
             msg = f"以下必要欄位尚未設定：{', '.join(missing)}\n請先完成帳戶設定。"
         else:
+            self._auto_refresh_if_enabled()
             return
         ret = QMessageBox.warning(
             self, "帳戶設定不完整", msg,
@@ -371,9 +481,18 @@ class MainWindow(QMainWindow):
         )
         if ret == QMessageBox.StandardButton.Ok:
             self._show_account_settings()
+        if not _check_env():
+            self._auto_refresh_if_enabled()
+
+    def _auto_refresh_if_enabled(self) -> None:
+        if os.getenv("AUTO_REFRESH", "false").lower() == "true":
+            self._on_refresh_clicked()
 
     def _setup_menu(self) -> None:
         menu_bar = self.menuBar()
+
+        sys_action = menu_bar.addAction("系統設定")
+        sys_action.triggered.connect(self._show_system_settings)
 
         settings_action = menu_bar.addAction("帳戶設定")
         settings_action.triggered.connect(self._show_account_settings)
@@ -381,15 +500,33 @@ class MainWindow(QMainWindow):
         about_action = menu_bar.addAction("關於")
         about_action.triggered.connect(self._show_about)
 
+    def _show_system_settings(self) -> None:
+        dlg = SystemSettingsDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage("系統設定已儲存")
+            self._update_positions_tab_visibility()
+            if self._last_data is not None:
+                self._populate_realtime(self._last_data)
+                self._update_positions_content()
+            self._refresh_account_dropdown()
+            self._load_history()
+
     def _show_account_settings(self) -> None:
         dlg = AccountSettingsDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.statusBar().showMessage("帳戶設定已儲存")
+            if self._last_data is not None:
+                self._populate_realtime(self._last_data)
+            self._refresh_account_dropdown()
+            self._load_history()
 
     def _show_about(self) -> None:
         AboutDialog(self).exec()
 
     def _build_realtime_tab(self) -> QWidget:
+        self._stock_selector: QComboBox | None = None
+        self._futopt_selector: QComboBox | None = None
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         container = QWidget()
@@ -416,7 +553,7 @@ class MainWindow(QMainWindow):
         filter_row.addStretch()
         layout.addLayout(filter_row)
 
-        cols = ["日期", "帳戶", "可用餘額", "待交割款", "現金水位",
+        cols = ["日期", "帳戶", "可用餘額", "T+1 交割", "T+2 交割", "現金水位",
                 "股票市值", "總資產", "現金佔比%", "期貨權益"]
         self._history_table = QTableWidget(0, len(cols))
         self._history_table.setHorizontalHeaderLabels(cols)
@@ -426,6 +563,32 @@ class MainWindow(QMainWindow):
         )
         self._history_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self._history_table)
+        return widget
+
+    def _build_positions_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+
+        selector_row = QHBoxLayout()
+        selector_row.addWidget(QLabel("股票帳戶："))
+        self._positions_selector = QComboBox()
+        self._positions_selector.currentIndexChanged.connect(self._update_positions_table)
+        selector_row.addWidget(self._positions_selector)
+        selector_row.addStretch()
+        layout.addLayout(selector_row)
+
+        cols = ["股票代號", "股票名稱", "數量(股)", "成本", "股價", "市值", "未實現損益"]
+        self._positions_table = QTableWidget(0, len(cols))
+        self._positions_table.setHorizontalHeaderLabels(cols)
+        self._positions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._positions_table.verticalHeader().setVisible(False)
+        self._positions_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self._positions_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self._positions_table)
         return widget
 
     # ------------------------------------------------------------------
@@ -450,7 +613,9 @@ class MainWindow(QMainWindow):
         self._worker.start()
 
     def _on_worker_finished(self, data: dict) -> None:
-        self._populate_realtime(data)
+        self._last_data = data
+        self._rebuild_realtime_content()
+        self._update_positions_content()
         self._last_update_lbl.setText(
             f"最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
@@ -465,43 +630,80 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "連線錯誤", msg)
 
     def _populate_realtime(self, data: dict) -> None:
-        # clear
+        """設定儲存後重新套用遮罩時呼叫。"""
+        self._rebuild_realtime_content()
+
+    def _rebuild_realtime_content(self) -> None:
+        """清空並重建即時狀態內容，保留上次選取的帳戶。"""
+        if self._last_data is None:
+            return
+        data = self._last_data
+
+        # 儲存上次選取（重建前先讀取）
+        prev_stock  = self._stock_selector.currentData()  if self._stock_selector  else None
+        prev_futopt = self._futopt_selector.currentData() if self._futopt_selector else None
+
+        # 清空 layout
         while self._realtime_layout.count():
             item = self._realtime_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        # stock accounts
-        for sa in data["stock_accounts"]:
-            self._realtime_layout.addWidget(
-                self._section_header(f"股票帳戶：{sa['account_id']}")
-            )
-            self._realtime_layout.addWidget(self._position_table(sa["positions"]))
-            lbl = QLabel(
-                f"現金：{sa['cash_balance']:,.0f}　　"
-                f"待交割：{sa['total_settlement']:,.0f}　　"
-                f"市值：{sa['stock_market_value']:,.0f}"
-            )
-            lbl.setContentsMargins(4, 2, 4, 8)
-            self._realtime_layout.addWidget(lbl)
+        def _make_selector(accounts: list, prev_sel: str | None) -> QComboBox:
+            cb = QComboBox()
+            cb.setEnabled(len(accounts) > 1)
+            for acc in accounts:
+                cb.addItem(_mask_account_id(acc["account_id"]), acc["account_id"])
+            idx = cb.findData(prev_sel)
+            if idx >= 0:
+                cb.setCurrentIndex(idx)
+            cb.currentIndexChanged.connect(self._rebuild_realtime_content)
+            return cb
 
-        # futopt accounts
-        for fa in data["futopt_accounts"]:
-            self._realtime_layout.addWidget(
-                self._section_header(f"期貨帳戶：{fa['account_id']}")
-            )
-            self._realtime_layout.addWidget(self._futopt_form(fa))
+        def _section_header_row(label: str, cb: QComboBox) -> QWidget:
+            w = QWidget()
+            row = QHBoxLayout(w)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(self._section_header(label))
+            row.addWidget(cb)
+            row.addStretch()
+            return w
 
-        # separator
+        # === 股票帳戶區塊 ===
+        if data["stock_accounts"]:
+            self._stock_selector = _make_selector(data["stock_accounts"], prev_stock)
+            self._realtime_layout.addWidget(
+                _section_header_row("股票帳戶", self._stock_selector)
+            )
+            acc_id = self._stock_selector.currentData()
+            sa = next((s for s in data["stock_accounts"] if s["account_id"] == acc_id), None)
+            if sa:
+                self._realtime_layout.addWidget(self._cash_summary_widget(sa))
+
+        # === 期貨帳戶區塊 ===
+        if data["futopt_accounts"]:
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            self._realtime_layout.addWidget(line)
+
+            self._futopt_selector = _make_selector(data["futopt_accounts"], prev_futopt)
+            self._realtime_layout.addWidget(
+                _section_header_row("期貨帳戶", self._futopt_selector)
+            )
+            acc_id = self._futopt_selector.currentData()
+            fa = next((f for f in data["futopt_accounts"] if f["account_id"] == acc_id), None)
+            if fa:
+                self._realtime_layout.addWidget(self._futopt_form(fa))
+
+        # === 跨帳戶合計 ===
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         self._realtime_layout.addWidget(line)
 
-        # summary
         lbl = QLabel(
             f"現金水位：{data['cash_level']:,.0f} 元  （{data['cash_ratio']:.1f}%）　　"
             f"總資產：{data['total_assets']:,.0f} 元\n"
-            f"（總資產 = 現金水位 + 股票市值）"
+            f"（總資產 = 現金水位 + 股票市值，跨所有帳戶合計）"
         )
         font = lbl.font()
         font.setBold(True)
@@ -530,34 +732,6 @@ class MainWindow(QMainWindow):
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return item
 
-    def _position_table(self, positions: list) -> QTableWidget:
-        cols = ["代碼", "數量", "成本", "現價", "市值", "未實現損益"]
-        tbl = QTableWidget(max(len(positions), 1), len(cols))
-        tbl.setHorizontalHeaderLabels(cols)
-        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        tbl.verticalHeader().setVisible(False)
-        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setStretchLastSection(True)
-        tbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-        if not positions:
-            item = QTableWidgetItem("目前無股票持倉")
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            tbl.setItem(0, 0, item)
-            tbl.setSpan(0, 0, 1, len(cols))
-            tbl.setFixedHeight(50)
-            return tbl
-
-        for r, pos in enumerate(positions):
-            tbl.setItem(r, 0, QTableWidgetItem(pos["code"]))
-            tbl.setItem(r, 1, self._num_item(pos["quantity"], "d"))
-            tbl.setItem(r, 2, self._num_item(pos["cost_price"], ".2f"))
-            tbl.setItem(r, 3, self._num_item(pos["last_price"], ".2f"))
-            tbl.setItem(r, 4, self._num_item(pos["market_value"]))
-            tbl.setItem(r, 5, self._num_item(pos["pnl"]))
-        tbl.setFixedHeight(min(len(positions) * 28 + 32, 220))
-        return tbl
-
     @staticmethod
     def _futopt_form(fa: dict) -> QWidget:
         widget = QWidget()
@@ -581,9 +755,101 @@ class MainWindow(QMainWindow):
             form.addRow(f"{label}：", lbl)
         return widget
 
+    @staticmethod
+    def _cash_summary_widget(sa: dict) -> QWidget:
+        """顯示現金、待交割明細（含日期）及交割後剩餘金額。"""
+        widget = QWidget()
+        form = QFormLayout(widget)
+        form.setContentsMargins(4, 4, 4, 8)
+        form.setSpacing(4)
+
+        def _rlabel(text: str, bold: bool = False, color: str = "") -> QLabel:
+            lbl = QLabel(text)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if bold:
+                font = lbl.font()
+                font.setBold(True)
+                lbl.setFont(font)
+            if color:
+                lbl.setStyleSheet(f"color: {color};")
+            return lbl
+
+        # 可用餘額
+        form.addRow("可用餘額：", _rlabel(f"{sa['cash_balance']:,.0f} 元"))
+
+        # 待交割明細（每筆獨立顯示）
+        settlements = sa.get("settlements", [])
+        if settlements:
+            for s in settlements:
+                t_tag = f"T+{s['T']}" if s["T"] > 0 else "T+0（已入帳）"
+                label = f"  {s['date']}（{t_tag}）："
+                form.addRow(label, _rlabel(f"{s['amount']:,.0f} 元"))
+
+        # 待交割淨額（T+1 起）
+        net_lbl = _rlabel(f"{sa['settlement_t1'] + sa['settlement_t2']:,.0f} 元")
+        form.addRow("待交割淨額（T+1 起）：", net_lbl)
+
+        # 交割後餘額（= 可用餘額 + 待交割淨額）
+        cash_level = sa["cash_level"]
+        cash_color = "#c0392b" if cash_level < 0 else ""
+        form.addRow("交割後餘額：", _rlabel(f"{cash_level:,.0f} 元", bold=True, color=cash_color))
+
+        # 股票市值
+        form.addRow("股票市值：", _rlabel(f"{sa['stock_market_value']:,.0f} 元"))
+
+        return widget
+
     # ------------------------------------------------------------------
     # History tab
     # ------------------------------------------------------------------
+
+    def _update_positions_tab_visibility(self) -> None:
+        visible = os.getenv("SHOW_STOCK_POSITIONS", "false").lower() == "true"
+        self._tabs.tabBar().setTabVisible(self._positions_tab_index, visible)
+
+    def _update_positions_content(self) -> None:
+        if self._last_data is None:
+            return
+        stock_accs = self._last_data["stock_accounts"]
+        prev = self._positions_selector.currentData()
+        self._positions_selector.blockSignals(True)
+        self._positions_selector.clear()
+        for sa in stock_accs:
+            self._positions_selector.addItem(
+                _mask_account_id(sa["account_id"]), sa["account_id"]
+            )
+        idx = self._positions_selector.findData(prev)
+        self._positions_selector.setCurrentIndex(idx if idx >= 0 else 0)
+        self._positions_selector.blockSignals(False)
+        self._update_positions_table()
+
+    def _update_positions_table(self) -> None:
+        if self._last_data is None:
+            return
+        acc_id = self._positions_selector.currentData()
+        sa = next(
+            (s for s in self._last_data["stock_accounts"] if s["account_id"] == acc_id),
+            None,
+        )
+        positions = sa["positions"] if sa else []
+        cols = self._positions_table.columnCount()
+        if not positions:
+            self._positions_table.setRowCount(1)
+            item = QTableWidgetItem("目前無股票持倉（或未啟用股票庫存抓取）")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._positions_table.setItem(0, 0, item)
+            self._positions_table.setSpan(0, 0, 1, cols)
+            return
+        self._positions_table.clearSpans()
+        self._positions_table.setRowCount(len(positions))
+        for r, pos in enumerate(positions):
+            self._positions_table.setItem(r, 0, QTableWidgetItem(pos["code"]))
+            self._positions_table.setItem(r, 1, QTableWidgetItem(pos.get("name", "")))
+            self._positions_table.setItem(r, 2, self._num_item(pos["quantity"], ",d"))
+            self._positions_table.setItem(r, 3, self._num_item(pos["cost_price"], ".2f"))
+            self._positions_table.setItem(r, 4, self._num_item(pos["last_price"], ".2f"))
+            self._positions_table.setItem(r, 5, self._num_item(pos["market_value"]))
+            self._positions_table.setItem(r, 6, self._num_item(pos["pnl"]))
 
     def _refresh_account_dropdown(self) -> None:
         current = self._account_filter.currentData()
@@ -591,7 +857,7 @@ class MainWindow(QMainWindow):
         self._account_filter.clear()
         self._account_filter.addItem("全部", None)
         for acc_id in list_account_ids():
-            self._account_filter.addItem(acc_id, acc_id)
+            self._account_filter.addItem(_mask_account_id(acc_id), acc_id)
         idx = self._account_filter.findData(current)
         self._account_filter.setCurrentIndex(idx if idx >= 0 else 0)
         self._account_filter.blockSignals(False)
@@ -602,16 +868,16 @@ class MainWindow(QMainWindow):
         self._history_table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             self._history_table.setItem(r, 0, QTableWidgetItem(row.get("date", "")))
-            self._history_table.setItem(r, 1, QTableWidgetItem(row.get("account_id", "")))
+            self._history_table.setItem(r, 1, QTableWidgetItem(_mask_account_id(row.get("account_id", ""))))
             for c, key in enumerate(
-                ["cash_balance", "total_settlement", "cash_level",
+                ["cash_balance", "settlement_t1", "settlement_t2", "cash_level",
                  "stock_market_value", "total_assets"],
                 start=2,
             ):
                 self._history_table.setItem(r, c, self._num_item(row.get(key)))
             cr = row.get("cash_ratio")
-            self._history_table.setItem(r, 7, self._num_item(cr, ".1f"))
-            self._history_table.setItem(r, 8, self._num_item(row.get("futopt_equity")))
+            self._history_table.setItem(r, 8, self._num_item(cr, ".1f"))
+            self._history_table.setItem(r, 9, self._num_item(row.get("futopt_equity")))
 
 
 # ---------------------------------------------------------------------------

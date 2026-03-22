@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import shioaji as sj
 
 from core import fetch_all_accounts, StockAccountData, FutoptAccountData, AllAccountsData
-from db import save_snapshot
+from db import reconcile_previous_snapshot, save_snapshot
 
 load_dotenv()
 
@@ -17,13 +17,13 @@ def _print_stock_account(data: StockAccountData) -> None:
 
     print(f"\n=== 股票部位 [{label}] ===")
     if data["positions"]:
-        print(f"{'代碼':<8} {'數量':>6} {'成本':>10} {'現價':>10} {'市值':>12} {'未實現損益':>12}")
-        print("-" * 62)
+        print(f"{'股票代號':<8} {'股票名稱':<10} {'數量(股)':>10} {'成本':>10} {'股價':>10} {'市值':>12} {'未實現損益':>12}")
+        print("-" * 76)
         for pos in data["positions"]:
             print(
-                f"{pos['code']:<8} {pos['quantity']:>6} {pos['cost_price']:>10.2f} "
-                f"{pos['last_price']:>10.2f} {pos['market_value']:>12,.0f} "
-                f"{pos['pnl']:>12,.0f}"
+                f"{pos['code']:<8} {pos.get('name', ''):<10} {pos['quantity']:>10,} "
+                f"{pos['cost_price']:>10.2f} {pos['last_price']:>10.2f} "
+                f"{pos['market_value']:>12,.0f} {pos['pnl']:>12,.0f}"
             )
         print(f"\n股票市值合計：{data['stock_market_value']:>12,.0f} 元")
     else:
@@ -38,7 +38,7 @@ def _print_stock_account(data: StockAccountData) -> None:
         print("-" * 28)
         for s in data["settlements"]:
             print(f"{s['date']:<12} {s['amount']:>14,.0f}")
-        print(f"\n待交割合計：{data['total_settlement']:>12,.0f} 元")
+        print(f"\n待交割合計：{data['settlement_t1'] + data['settlement_t2']:>12,.0f} 元")
     else:
         print("目前無待交割款項")
 
@@ -56,30 +56,37 @@ def _print_futopt_account(data: FutoptAccountData) -> None:
 
 
 def show_account_status(api) -> None:
-    today = str(date.today())
     data: AllAccountsData = fetch_all_accounts(api)
+    stock_accs = data["stock_accounts"]
+    snapshot_date = stock_accs[0]["snapshot_date"] if stock_accs else str(date.today())
 
-    for sa in data["stock_accounts"]:
+    for sa in stock_accs:
         _print_stock_account(sa)
         save_snapshot({
-            "date": today,
+            "date": sa["snapshot_date"],
             "account_id": sa["account_id"],
             "cash_balance": sa["cash_balance"],
-            "total_settlement": sa["total_settlement"],
+            "settlement_t1": sa["settlement_t1"],
+            "settlement_t2": sa["settlement_t2"],
             "cash_level": sa["cash_level"],
             "stock_market_value": sa["stock_market_value"],
             "total_assets": sa["total_assets"],
             "cash_ratio": sa["cash_ratio"],
             "futopt_equity": None,
         })
+        reconcile_previous_snapshot(
+            sa["account_id"], sa["snapshot_date"],
+            sa["settlement_t0"], sa["settlement_t1"],
+        )
 
     for fa in data["futopt_accounts"]:
         _print_futopt_account(fa)
         save_snapshot({
-            "date": today,
+            "date": snapshot_date,
             "account_id": fa["account_id"],
             "cash_balance": None,
-            "total_settlement": None,
+            "settlement_t1": None,
+            "settlement_t2": None,
             "cash_level": None,
             "stock_market_value": None,
             "total_assets": None,
@@ -87,8 +94,9 @@ def show_account_status(api) -> None:
             "futopt_equity": fa["futopt_equity"],
         })
 
-    total_cash       = sum(sa["cash_balance"]       for sa in data["stock_accounts"])
-    total_settlement = sum(sa["total_settlement"]   for sa in data["stock_accounts"])
+    total_cash       = sum(sa["cash_balance"]     for sa in data["stock_accounts"])
+    total_settlement = sum(sa["settlement_t1"] + sa["settlement_t2"]
+                           for sa in data["stock_accounts"])
     cl = data["cash_level"]
     ta = data["total_assets"]
     cr = data["cash_ratio"]

@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 from typing import TypedDict
 
@@ -6,7 +7,8 @@ import shioaji as sj
 
 class PositionRow(TypedDict):
     code: str
-    quantity: int
+    name: str
+    quantity: int       # 以「股」為單位
     cost_price: float
     last_price: float
     market_value: float
@@ -15,10 +17,13 @@ class PositionRow(TypedDict):
 
 class StockAccountData(TypedDict):
     account_id: str
+    snapshot_date: str        # T+0 交割日（即當天交易日）
     positions: list[PositionRow]
     stock_market_value: float
     cash_balance: float
-    total_settlement: float
+    settlement_t0: float      # 今日已入帳金額（T=0）
+    settlement_t1: float
+    settlement_t2: float
     cash_level: float
     total_assets: float
     cash_ratio: float
@@ -54,11 +59,15 @@ def fetch_stock_account(api: sj.Shioaji, acc) -> StockAccountData:
     positions: list[PositionRow] = []
     stock_market_value = Decimal(0)
     for pos in positions_raw:
-        market_value = Decimal(str(pos.last_price)) * pos.quantity * 1000
+        shares = pos.quantity * 1000
+        market_value = Decimal(str(pos.last_price)) * shares
         stock_market_value += market_value
+        contract = api.Contracts.Stocks.get(pos.code)
+        name = contract.name if contract else ""
         positions.append({
             "code": pos.code,
-            "quantity": pos.quantity,
+            "name": name,
+            "quantity": shares,
             "cost_price": float(pos.price),
             "last_price": float(pos.last_price),
             "market_value": float(market_value),
@@ -69,23 +78,34 @@ def fetch_stock_account(api: sj.Shioaji, acc) -> StockAccountData:
     cash_balance = Decimal(str(balance.acc_balance))
 
     settlements_raw = api.settlements(acc)
-    total_settlement = Decimal(0)
+    snapshot_date = str(date.today())  # fallback
+    settlement_t0 = Decimal(0)
+    settlement_t1 = Decimal(0)
+    settlement_t2 = Decimal(0)
     settlements = []
     for s in settlements_raw:
         settlements.append({"date": str(s.date), "amount": float(s.amount), "T": s.T})
-        if s.T != 0:
-            total_settlement += Decimal(str(s.amount))
+        if s.T == 0:
+            snapshot_date = str(s.date)
+            settlement_t0 = Decimal(str(s.amount))
+        elif s.T == 1:
+            settlement_t1 += Decimal(str(s.amount))
+        elif s.T == 2:
+            settlement_t2 += Decimal(str(s.amount))
 
-    cash_level = cash_balance + total_settlement
+    cash_level = cash_balance + settlement_t1 + settlement_t2
     total_assets = cash_level + stock_market_value
     cash_ratio = float(cash_level) / float(total_assets) * 100 if total_assets else 0.0
 
     return {
         "account_id": label,
+        "snapshot_date": snapshot_date,
         "positions": positions,
         "stock_market_value": float(stock_market_value),
         "cash_balance": float(cash_balance),
-        "total_settlement": float(total_settlement),
+        "settlement_t0": float(settlement_t0),
+        "settlement_t1": float(settlement_t1),
+        "settlement_t2": float(settlement_t2),
         "cash_level": float(cash_level),
         "total_assets": float(total_assets),
         "cash_ratio": cash_ratio,
@@ -120,13 +140,14 @@ def fetch_all_accounts(api: sj.Shioaji) -> AllAccountsData:
     futopt_accs = [a for a in all_accounts if "Futopt" in type(a).__name__
                    or "Future" in type(a).__name__]
 
-    stock_accounts  = [fetch_stock_account(api, acc)  for acc in stock_accs]
+    stock_accounts  = [fetch_stock_account(api, acc) for acc in stock_accs]
     futopt_accounts = [fetch_futopt_account(api, acc) for acc in futopt_accs]
 
-    total_cash       = Decimal(str(sum(sa["cash_balance"]       for sa in stock_accounts)))
-    total_settlement = Decimal(str(sum(sa["total_settlement"]   for sa in stock_accounts)))
-    total_stock_mv   = Decimal(str(sum(sa["stock_market_value"] for sa in stock_accounts)))
-    cash_level   = total_cash + total_settlement
+    total_cash     = Decimal(str(sum(sa["cash_balance"]     for sa in stock_accounts)))
+    total_t1       = Decimal(str(sum(sa["settlement_t1"]   for sa in stock_accounts)))
+    total_t2       = Decimal(str(sum(sa["settlement_t2"]   for sa in stock_accounts)))
+    total_stock_mv = Decimal(str(sum(sa["stock_market_value"] for sa in stock_accounts)))
+    cash_level   = total_cash + total_t1 + total_t2
     total_assets = cash_level + total_stock_mv
     cash_ratio   = float(cash_level) / float(total_assets) * 100 if total_assets else 0.0
 
