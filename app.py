@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -24,6 +25,16 @@ load_dotenv(ENV_PATH)
 # ---------------------------------------------------------------------------
 # Dialogs
 # ---------------------------------------------------------------------------
+
+def _mask_person_id(msg: str) -> str:
+    """若錯誤訊息中含有 person_id 值，僅保留前 3 碼，其餘以星號取代。"""
+    def _replace(m: re.Match) -> str:
+        value = m.group(1)
+        if len(value) <= 3:
+            return m.group(0)
+        return m.group(0).replace(value, value[:3] + "*" * (len(value) - 3))
+    return re.sub(r"person_id[^A-Za-z0-9]*([A-Za-z0-9]+)", _replace, msg)
+
 
 def _mask_account_id(acc_id: str) -> str:
     """若 HIDE_ACCOUNT_INFO=true，將 acc_id 中 '-' 之後的部分以星號取代。"""
@@ -67,7 +78,7 @@ class _ApiTestWorker(QThread):
                 api.activate_ca(ca_path=self._ca_path, ca_passwd=self._ca_passwd)
             self.result.emit(True, "成功")
         except Exception as e:
-            self.result.emit(False, str(e))
+            self.result.emit(False, _mask_person_id(str(e)))
         finally:
             try:
                 api.logout()
@@ -319,7 +330,7 @@ class AboutDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         inner.addWidget(title)
 
-        app_version = "0.3.0"
+        app_version = "0.3.1"
         sj_version  = getattr(sj, "__version__", "未知")
         info = QLabel(f"版本：{app_version}\nShioaji 版本：{sj_version}")
         info.setAlignment(Qt.AlignmentFlag.AlignCenter)
