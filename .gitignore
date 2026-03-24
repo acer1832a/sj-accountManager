@@ -30,6 +30,10 @@ build/
 # uv
 .python-version
 
+# Claude Code
+CLAUDE.md
+.claude/
+
 # IDE
 .vscode/
 .idea/

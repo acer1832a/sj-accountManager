@@ -1,8 +1,36 @@
+import time
 from datetime import date
 from decimal import Decimal
+from threading import Lock
 from typing import TypedDict
 
 import shioaji as sj
+
+
+class _RateLimiter:
+    """滑動視窗速率限制器，確保在 period 秒內不超過 max_calls 次呼叫。"""
+
+    def __init__(self, max_calls: int, period: float) -> None:
+        self._max_calls = max_calls
+        self._period = period
+        self._calls: list[float] = []
+        self._lock = Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._calls = [t for t in self._calls if now - t < self._period]
+            if len(self._calls) >= self._max_calls:
+                sleep_time = self._period - (now - self._calls[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                now = time.monotonic()
+                self._calls = [t for t in self._calls if now - t < self._period]
+            self._calls.append(time.monotonic())
+
+
+# Accounting API：25 次 / 5 秒
+_acct_limiter = _RateLimiter(25, 5.0)
 
 
 class PositionRow(TypedDict):
@@ -52,9 +80,10 @@ def acc_label(acc) -> str:
     return f"{acc.broker_id}-{acc.account_id}"
 
 
-def fetch_stock_account(api: sj.Shioaji, acc) -> StockAccountData:
+def fetch_stock_account(api: sj.Shioaji, acc, fetch_names: bool = False) -> StockAccountData:
     label = acc_label(acc)
 
+    _acct_limiter.wait()
     positions_raw = api.list_positions(acc)
     positions: list[PositionRow] = []
     stock_market_value = Decimal(0)
@@ -62,8 +91,11 @@ def fetch_stock_account(api: sj.Shioaji, acc) -> StockAccountData:
         shares = pos.quantity * 1000
         market_value = Decimal(str(pos.last_price)) * shares
         stock_market_value += market_value
-        contract = api.Contracts.Stocks.get(pos.code)
-        name = contract.name if contract else ""
+        if fetch_names:
+            contract = api.Contracts.Stocks.get(pos.code)
+            name = contract.name if contract else ""
+        else:
+            name = ""
         positions.append({
             "code": pos.code,
             "name": name,
@@ -74,9 +106,11 @@ def fetch_stock_account(api: sj.Shioaji, acc) -> StockAccountData:
             "pnl": float(pos.pnl),
         })
 
+    _acct_limiter.wait()
     balance = api.account_balance(account=acc)
     cash_balance = Decimal(str(balance.acc_balance))
 
+    _acct_limiter.wait()
     settlements_raw = api.settlements(acc)
     snapshot_date = str(date.today())  # fallback
     settlement_t0 = Decimal(0)
@@ -115,6 +149,7 @@ def fetch_stock_account(api: sj.Shioaji, acc) -> StockAccountData:
 
 def fetch_futopt_account(api: sj.Shioaji, acc) -> FutoptAccountData:
     label = acc_label(acc)
+    _acct_limiter.wait()
     margin = api.margin(acc)
     today_balance     = Decimal(str(margin.today_balance))
     future_open_pnl   = Decimal(str(margin.future_open_position))
@@ -134,13 +169,13 @@ def fetch_futopt_account(api: sj.Shioaji, acc) -> FutoptAccountData:
     }
 
 
-def fetch_all_accounts(api: sj.Shioaji) -> AllAccountsData:
+def fetch_all_accounts(api: sj.Shioaji, fetch_names: bool = False) -> AllAccountsData:
     all_accounts = api.list_accounts()
     stock_accs  = [a for a in all_accounts if "Stock"  in type(a).__name__]
     futopt_accs = [a for a in all_accounts if "Futopt" in type(a).__name__
                    or "Future" in type(a).__name__]
 
-    stock_accounts  = [fetch_stock_account(api, acc) for acc in stock_accs]
+    stock_accounts  = [fetch_stock_account(api, acc, fetch_names) for acc in stock_accs]
     futopt_accounts = [fetch_futopt_account(api, acc) for acc in futopt_accs]
 
     total_cash     = Decimal(str(sum(sa["cash_balance"]     for sa in stock_accounts)))

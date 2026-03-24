@@ -116,6 +116,31 @@ def reconcile_previous_snapshot(
     con.close()
 
 
+def load_previous_total_assets(current_date: str) -> float | None:
+    """
+    找出 current_date 之前最近一個有股票帳戶資料的交易日，
+    回傳該日所有股票帳戶的 total_assets 合計；若無資料則回傳 None。
+    """
+    con = _connect()
+    _ensure_schema(con)
+    cur = con.execute(
+        "SELECT MAX(date) FROM daily_snapshot WHERE date < ? AND total_assets IS NOT NULL",
+        (current_date,),
+    )
+    row = cur.fetchone()
+    if row is None or row[0] is None:
+        con.close()
+        return None
+    prev_date = row[0]
+    cur = con.execute(
+        "SELECT SUM(total_assets) FROM daily_snapshot WHERE date = ? AND total_assets IS NOT NULL",
+        (prev_date,),
+    )
+    result = cur.fetchone()
+    con.close()
+    return float(result[0]) if result and result[0] is not None else None
+
+
 def list_account_ids() -> list[str]:
     """回傳所有出現過的 account_id，供下拉選單使用。"""
     con = _connect()

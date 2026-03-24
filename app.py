@@ -7,15 +7,16 @@ from pathlib import Path
 from dotenv import load_dotenv, set_key
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QScrollArea,
-    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
 import shioaji as sj
 
 from core import fetch_all_accounts
-from db import list_account_ids, load_snapshots, reconcile_previous_snapshot, save_snapshot
+from db import (list_account_ids, load_previous_total_assets, load_snapshots,
+                reconcile_previous_snapshot, save_snapshot)
 
 ENV_PATH = Path(__file__).parent / ".env"
 
@@ -25,6 +26,15 @@ load_dotenv(ENV_PATH)
 # ---------------------------------------------------------------------------
 # Dialogs
 # ---------------------------------------------------------------------------
+
+def _enrich_error(msg: str) -> str:
+    """針對已知錯誤訊息補充說明。"""
+    if "Token doesn't have production permission" in msg:
+        msg += "\n（該 API Key 無勾選正式環境，請重新產生 API Key）"
+    elif "Token doesn't have permission" in msg:
+        msg += "\n（該 API Key 無勾選帳務權限，請重新產生 API Key）"
+    return msg
+
 
 def _mask_person_id(msg: str) -> str:
     """若錯誤訊息中含有 person_id 值，僅保留前 3 碼，其餘以星號取代。"""
@@ -59,26 +69,21 @@ def _bordered_dialog(dlg: "QDialog") -> QFrame:
 
 
 class _ApiTestWorker(QThread):
-    """背景執行 Shioaji 登入（或登入＋啟用憑證）測試。"""
+    """背景執行 Shioaji 登入測試。"""
     result = pyqtSignal(bool, str)  # success, message
 
-    def __init__(self, api_key: str, secret_key: str,
-                 ca_path: str = "", ca_passwd: str = "") -> None:
+    def __init__(self, api_key: str, secret_key: str) -> None:
         super().__init__()
         self._api_key    = api_key
         self._secret_key = secret_key
-        self._ca_path    = ca_path
-        self._ca_passwd  = ca_passwd
 
     def run(self) -> None:
         api = sj.Shioaji()
         try:
             api.login(api_key=self._api_key, secret_key=self._secret_key)
-            if self._ca_path:
-                api.activate_ca(ca_path=self._ca_path, ca_passwd=self._ca_passwd)
             self.result.emit(True, "成功")
         except Exception as e:
-            self.result.emit(False, _mask_person_id(str(e)))
+            self.result.emit(False, _enrich_error(_mask_person_id(str(e))))
         finally:
             try:
                 api.logout()
@@ -94,8 +99,10 @@ class AccountSettingsDialog(QDialog):
         self.setWindowTitle("帳戶設定")
         self.setMinimumWidth(460)
         self._worker: _ApiTestWorker | None = None
-        self._orig_api_key    = os.getenv("API_KEY", "")
-        self._orig_secret_key = os.getenv("SECRET_KEY", "")
+        self._orig_api_key      = os.getenv("API_KEY", "")
+        self._orig_secret_key   = os.getenv("SECRET_KEY", "")
+        self._verified_api_key    = ""
+        self._verified_secret_key = ""
 
         frame = _bordered_dialog(self)
         inner = QVBoxLayout(frame)
@@ -114,45 +121,20 @@ class AccountSettingsDialog(QDialog):
         self._inputs["SECRET_KEY"] = QLineEdit(os.getenv("SECRET_KEY", ""))
         form.addRow("Secret Key：", self._inputs["SECRET_KEY"])
 
-        # 憑證路徑 + 瀏覽按鈕
-        ca_path_row = QHBoxLayout()
-        self._inputs["YOUR_CA_PATH"] = QLineEdit(os.getenv("YOUR_CA_PATH", ""))
-        browse_btn = QPushButton("瀏覽...")
-        browse_btn.setFixedWidth(64)
-        browse_btn.clicked.connect(self._browse_ca)
-        ca_path_row.addWidget(self._inputs["YOUR_CA_PATH"])
-        ca_path_row.addWidget(browse_btn)
-        form.addRow("憑證路徑：", ca_path_row)
-
-        # 憑證密碼 + 顯示/隱藏切換按鈕
-        ca_pass_row = QHBoxLayout()
-        ca_pass_edit = QLineEdit(os.getenv("YOUR_CA_PASS", ""))
-        ca_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self._inputs["YOUR_CA_PASS"] = ca_pass_edit
-        toggle_btn = QPushButton("顯示")
-        toggle_btn.setFixedWidth(64)
-        toggle_btn.setCheckable(True)
-        toggle_btn.toggled.connect(self._toggle_ca_pass)
-        ca_pass_row.addWidget(ca_pass_edit)
-        ca_pass_row.addWidget(toggle_btn)
-        form.addRow("憑證密碼：", ca_pass_row)
-
         inner.addLayout(form)
 
         # 測試按鈕列
         test_row = QHBoxLayout()
         self._test_key_btn = QPushButton("測試登入 Key")
-        self._test_ca_btn  = QPushButton("測試憑證")
         self._test_key_btn.clicked.connect(self._test_login_key)
-        self._test_ca_btn.clicked.connect(self._test_ca)
         test_row.addWidget(self._test_key_btn)
-        test_row.addWidget(self._test_ca_btn)
         test_row.addStretch()
         inner.addLayout(test_row)
 
         # 測試結果標籤
-        self._test_status = QLabel("")
-        self._test_status.setWordWrap(True)
+        self._test_status = QTextEdit("")
+        self._test_status.setReadOnly(True)
+        self._test_status.setFixedHeight(72)
         inner.addWidget(self._test_status)
 
         # 儲存 / 取消
@@ -166,30 +148,12 @@ class AccountSettingsDialog(QDialog):
 
     # ------------------------------------------------------------------
 
-    def _browse_ca(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "選擇憑證檔案", "", "憑證檔案 (*.pfx *.p12 *.pem *.cer);;所有檔案 (*)"
-        )
-        if path:
-            self._inputs["YOUR_CA_PATH"].setText(path)
-
-    def _toggle_ca_pass(self, checked: bool) -> None:
-        edit = self._inputs["YOUR_CA_PASS"]
-        btn = self.sender()
-        if checked:
-            edit.setEchoMode(QLineEdit.EchoMode.Normal)
-            btn.setText("隱藏")
-        else:
-            edit.setEchoMode(QLineEdit.EchoMode.Password)
-            btn.setText("顯示")
-
     def _set_testing(self, testing: bool) -> None:
         self._test_key_btn.setEnabled(not testing)
-        self._test_ca_btn.setEnabled(not testing)
         self._button_box.setEnabled(not testing)
         if testing:
             self._test_status.setStyleSheet("")
-            self._test_status.setText("測試中，請稍候...")
+            self._test_status.setPlainText("測試中，請稍候...")
 
     def _test_login_key(self) -> None:
         api_key    = self._inputs["API_KEY"].text().strip()
@@ -199,29 +163,24 @@ class AccountSettingsDialog(QDialog):
             return
         self._set_testing(True)
         self._worker = _ApiTestWorker(api_key, secret_key)
-        self._worker.result.connect(lambda ok, msg: self._show_status(ok, f"登入測試：{msg}"))
+        self._worker.result.connect(
+            lambda ok, msg, k=api_key, s=secret_key: self._on_login_test_result(ok, msg, k, s)
+        )
         self._worker.start()
 
-    def _test_ca(self) -> None:
-        api_key    = self._inputs["API_KEY"].text().strip()
-        secret_key = self._inputs["SECRET_KEY"].text().strip()
-        ca_path    = self._inputs["YOUR_CA_PATH"].text().strip()
-        ca_passwd  = self._inputs["YOUR_CA_PASS"].text().strip()
-        if not api_key or not secret_key:
-            self._show_status(False, "請先填寫 API Key 及 Secret Key")
-            return
-        if not ca_path or not ca_passwd:
-            self._show_status(False, "請先填寫憑證路徑及憑證密碼")
-            return
-        self._set_testing(True)
-        self._worker = _ApiTestWorker(api_key, secret_key, ca_path, ca_passwd)
-        self._worker.result.connect(lambda ok, msg: self._show_status(ok, f"憑證測試：{msg}"))
-        self._worker.start()
+    def _on_login_test_result(self, success: bool, msg: str,
+                              api_key: str, secret_key: str) -> None:
+        if success:
+            self._verified_api_key    = api_key
+            self._verified_secret_key = secret_key
+        self._show_status(success, f"登入測試：{msg}")
 
     def _show_status(self, success: bool, msg: str) -> None:
         color = "#1a7f37" if success else "#c0392b"
-        self._test_status.setStyleSheet(f"color: {color}; font-weight: bold;")
-        self._test_status.setText(msg)
+        self._test_status.setStyleSheet(
+            f"QTextEdit {{ color: {color}; font-weight: bold; }}"
+        )
+        self._test_status.setPlainText(msg)
         self._set_testing(False)
 
     def _save(self) -> None:
@@ -235,7 +194,9 @@ class AccountSettingsDialog(QDialog):
             return
         keys_changed = (api_key != self._orig_api_key or
                         secret_key != self._orig_secret_key)
-        if keys_changed:
+        already_verified = (api_key == self._verified_api_key and
+                            secret_key == self._verified_secret_key)
+        if keys_changed and not already_verified:
             self._set_testing(True)
             self._worker = _ApiTestWorker(api_key, secret_key)
             self._worker.result.connect(self._on_save_login_result)
@@ -330,7 +291,7 @@ class AboutDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         inner.addWidget(title)
 
-        app_version = "0.3.1"
+        app_version = "0.4.0"
         sj_version  = getattr(sj, "__version__", "未知")
         info = QLabel(f"版本：{app_version}\nShioaji 版本：{sj_version}")
         info.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -390,29 +351,27 @@ class FetchWorker(QThread):
     finished = pyqtSignal(dict)
     error    = pyqtSignal(str)
 
-    def __init__(self, api_key: str, secret_key: str,
-                 ca_path: str | None, ca_passwd: str | None):
+    def __init__(self, api_key: str, secret_key: str):
         super().__init__()
-        self._api_key   = api_key
+        self._api_key    = api_key
         self._secret_key = secret_key
-        self._ca_path   = ca_path
-        self._ca_passwd = ca_passwd
 
     def run(self) -> None:
         api = sj.Shioaji()
+        fetch_positions = os.getenv("SHOW_STOCK_POSITIONS", "false").lower() == "true"
         try:
             self.progress.emit("登入中...")
-            api.login(api_key=self._api_key, secret_key=self._secret_key)
-            if self._ca_path and self._ca_passwd:
-                self.progress.emit("啟用憑證...")
-                api.activate_ca(ca_path=self._ca_path, ca_passwd=self._ca_passwd)
+            if fetch_positions:
+                self.progress.emit("登入並下載商品檔...")
+            api.login(api_key=self._api_key, secret_key=self._secret_key,
+                      fetch_contract=fetch_positions)
             self.progress.emit("抓取帳戶資料...")
-            data = fetch_all_accounts(api)
+            data = fetch_all_accounts(api, fetch_names=fetch_positions)
             self.progress.emit("儲存快照...")
             _save_all_snapshots(data)
             self.finished.emit(data)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(_enrich_error(str(e)))
         finally:
             try:
                 api.logout()
@@ -613,11 +572,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "設定錯誤",
                                  "請在 .env 檔案中設定 API_KEY 和 SECRET_KEY")
             return
-        ca_path   = os.getenv("YOUR_CA_PATH")
-        ca_passwd = os.getenv("YOUR_CA_PASS")
-
         self._refresh_btn.setEnabled(False)
-        self._worker = FetchWorker(api_key, secret_key, ca_path, ca_passwd)
+        self._worker = FetchWorker(api_key, secret_key)
         self._worker.progress.connect(self.statusBar().showMessage)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.error.connect(self._on_worker_error)
@@ -711,16 +667,50 @@ class MainWindow(QMainWindow):
         line.setFrameShape(QFrame.Shape.HLine)
         self._realtime_layout.addWidget(line)
 
-        lbl = QLabel(
-            f"現金水位：{data['cash_level']:,.0f} 元  （{data['cash_ratio']:.1f}%）　　"
-            f"總資產：{data['total_assets']:,.0f} 元\n"
-            f"（總資產 = 現金水位 + 股票市值，跨所有帳戶合計）"
+        cash_level = data["cash_level"]
+        total_assets = data["total_assets"]
+        cash_color = ' style="color:#c0392b;"' if cash_level < 0 else ""
+        cash_html = (
+            f'<span{cash_color}>'
+            f'現金水位：{cash_level:,.0f} 元  （{data["cash_ratio"]:.1f}%）'
+            f'</span>'
         )
+
+        # 查前一交易日總資產
+        snapshot_date = (data["stock_accounts"][0]["snapshot_date"]
+                         if data["stock_accounts"] else str(date.today()))
+        prev_assets = load_previous_total_assets(snapshot_date)
+        if prev_assets is not None and prev_assets != 0:
+            diff = total_assets - prev_assets
+            diff_pct = diff / prev_assets * 100
+            diff_color = "#c0392b" if diff < 0 else "#1a7f37"
+            sign = "+" if diff >= 0 else ""
+            change_html = (
+                f'　<span style="color:{diff_color}; font-weight:bold;">'
+                f'（{sign}{diff:,.0f} 元 / {sign}{diff_pct:.2f}%）</span>'
+            )
+        else:
+            change_html = ""
+
+        lbl = QLabel(
+            f'{cash_html}　　'
+            f'總資產：{total_assets:,.0f} 元<br>'
+            f'<span style="font-weight:normal;">'
+            f'（總資產 = 現金水位 + 股票市值，跨所有帳戶合計）</span>'
+        )
+        lbl.setTextFormat(Qt.TextFormat.RichText)
         font = lbl.font()
         font.setBold(True)
         lbl.setFont(font)
         lbl.setContentsMargins(4, 4, 4, 4)
         self._realtime_layout.addWidget(lbl)
+
+        if change_html:
+            change_lbl = QLabel(f'總資產變動（較前一交易日）：{change_html}')
+            change_lbl.setTextFormat(Qt.TextFormat.RichText)
+            change_lbl.setContentsMargins(4, 0, 4, 4)
+            self._realtime_layout.addWidget(change_lbl)
+
         self._realtime_layout.addStretch()
 
     # ------------------------------------------------------------------

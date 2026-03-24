@@ -1,4 +1,5 @@
 import os
+import sys
 from datetime import date
 
 from dotenv import load_dotenv
@@ -12,22 +13,51 @@ load_dotenv()
 DB_PATH = "account_history.db"
 
 
-def _print_stock_account(data: StockAccountData) -> None:
-    label = data["account_id"]
+def _red(text: str) -> str:
+    """若輸出至終端機，以 ANSI 紅色顯示文字；否則原樣回傳。"""
+    if sys.stdout.isatty():
+        return f"\033[91m{text}\033[0m"
+    return text
 
-    print(f"\n=== 股票部位 [{label}] ===")
-    if data["positions"]:
-        print(f"{'股票代號':<8} {'股票名稱':<10} {'數量(股)':>10} {'成本':>10} {'股價':>10} {'市值':>12} {'未實現損益':>12}")
-        print("-" * 76)
-        for pos in data["positions"]:
-            print(
-                f"{pos['code']:<8} {pos.get('name', ''):<10} {pos['quantity']:>10,} "
-                f"{pos['cost_price']:>10.2f} {pos['last_price']:>10.2f} "
-                f"{pos['market_value']:>12,.0f} {pos['pnl']:>12,.0f}"
-            )
-        print(f"\n股票市值合計：{data['stock_market_value']:>12,.0f} 元")
-    else:
-        print("目前無股票持倉")
+
+def _enrich_error(msg: str) -> str:
+    """針對已知錯誤訊息補充說明。"""
+    if "Token doesn't have production permission" in msg:
+        msg += "\n（該 API Key 無勾選正式環境，請重新產生 API Key）"
+    elif "Token doesn't have permission" in msg:
+        msg += "\n（該 API Key 無勾選帳務權限，請重新產生 API Key）"
+    return msg
+
+
+def _mask_account_id(acc_id: str) -> str:
+    """若 HIDE_ACCOUNT_INFO=true，將 acc_id 中 '-' 之後的部分以星號取代。"""
+    if os.getenv("HIDE_ACCOUNT_INFO", "false").lower() != "true":
+        return acc_id
+    if "-" in acc_id:
+        prefix, suffix = acc_id.split("-", 1)
+        return f"{prefix}-{'*' * len(suffix)}"
+    return acc_id
+
+
+def _print_stock_account(data: StockAccountData) -> None:
+    label = _mask_account_id(data["account_id"])
+    show_positions = os.getenv("SHOW_STOCK_POSITIONS", "false").lower() == "true"
+
+    if show_positions:
+        print(f"\n=== 股票部位 [{label}] ===")
+        if data["positions"]:
+            print(f"{'股票代號':<8} {'股票名稱':<10} {'數量(股)':>10} {'成本':>10} {'股價':>10} {'市值':>12} {'未實現損益':>12}")
+            print("-" * 76)
+            for pos in data["positions"]:
+                print(
+                    f"{pos['code']:<8} {pos.get('name', ''):<10} {pos['quantity']:>10,} "
+                    f"{pos['cost_price']:>10.2f} {pos['last_price']:>10.2f} "
+                    f"{pos['market_value']:>12,.0f} {pos['pnl']:>12,.0f}"
+                )
+        else:
+            print("目前無股票持倉")
+
+    print(f"\n股票市值合計 [{label}]：{data['stock_market_value']:>12,.0f} 元")
 
     print(f"\n=== 現金部位 [{label}] ===")
     print(f"可用餘額：{data['cash_balance']:>12,.0f} 元")
@@ -44,7 +74,7 @@ def _print_stock_account(data: StockAccountData) -> None:
 
 
 def _print_futopt_account(data: FutoptAccountData) -> None:
-    label = data["account_id"]
+    label = _mask_account_id(data["account_id"])
     print(f"\n=== 期貨權益數 [{label}] ===")
     print(f"今日餘額：              {data['today_balance']:>12,.0f} 元")
     print(f"期貨未平倉損益：        {data['future_open_pnl']:>12,.0f} 元")
@@ -56,7 +86,8 @@ def _print_futopt_account(data: FutoptAccountData) -> None:
 
 
 def show_account_status(api) -> None:
-    data: AllAccountsData = fetch_all_accounts(api)
+    fetch_positions = os.getenv("SHOW_STOCK_POSITIONS", "false").lower() == "true"
+    data: AllAccountsData = fetch_all_accounts(api, fetch_names=fetch_positions)
     stock_accs = data["stock_accounts"]
     snapshot_date = stock_accs[0]["snapshot_date"] if stock_accs else str(date.today())
 
@@ -101,11 +132,16 @@ def show_account_status(api) -> None:
     ta = data["total_assets"]
     cr = data["cash_ratio"]
 
+    cash_line = f"現金水位：        {cl:>12,.0f} 元  ({cr:.1f}%)"
+    if cl < 0:
+        cash_line = _red(cash_line)
+
     print("\n=== 現金水位（合計）===")
     print(f"可用餘額：        {total_cash:>12,.0f} 元")
     print(f"待交割款（淨額）：{total_settlement:>12,.0f} 元")
     print(f"{'─' * 36}")
-    print(f"現金水位：        {cl:>12,.0f} 元  ({cr:.1f}% / 總資產 {ta:,.0f} 元)")
+    print(cash_line)
+    print(f"總資產：          {ta:>12,.0f} 元")
     print(f"（總資產 = 現金水位 + 股票市值）")
     print(f"\n已儲存各帳戶快照至 {DB_PATH}")
 
@@ -113,33 +149,24 @@ def show_account_status(api) -> None:
 def main() -> None:
     api_key    = os.getenv("API_KEY")
     secret_key = os.getenv("SECRET_KEY")
-    ca_path    = os.getenv("YOUR_CA_PATH")
-    ca_passwd  = os.getenv("YOUR_CA_PASS")
 
     if not api_key or not secret_key:
         print("錯誤：請在 .env 檔案中設定 API_KEY 和 SECRET_KEY")
         return
 
     api = sj.Shioaji()
+    fetch_positions = os.getenv("SHOW_STOCK_POSITIONS", "false").lower() == "true"
 
-    print("登入中...")
-    accounts = api.login(api_key=api_key, secret_key=secret_key)
-
-    print("\n=== 帳戶清單 ===")
-    for acc in accounts:
-        print(acc)
-
-    if ca_path and ca_passwd:
-        print("\n啟用憑證中...")
-        api.activate_ca(ca_path=ca_path, ca_passwd=ca_passwd)
-        print("憑證啟用成功")
+    if fetch_positions:
+        print("登入並下載商品檔...")
     else:
-        print("\n警告：未設定 YOUR_CA_PATH 或 YOUR_CA_PASS，跳過憑證啟用")
+        print("登入中...")
+    api.login(api_key=api_key, secret_key=secret_key, fetch_contract=fetch_positions)
 
     try:
         show_account_status(api)
     except Exception as e:
-        print(f"\n錯誤：{e}")
+        print(f"\n錯誤：{_enrich_error(str(e))}")
     finally:
         api.logout()
         print("\n已登出")
