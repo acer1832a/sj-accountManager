@@ -18,7 +18,13 @@ from core import fetch_all_accounts
 from db import (list_account_ids, load_previous_total_assets, load_snapshots,
                 reconcile_previous_snapshot, save_snapshot)
 
-ENV_PATH = Path(__file__).parent / ".env"
+if getattr(sys, "frozen", False):
+    # PyInstaller 打包後，以 exe 所在目錄為基準
+    _BASE_DIR = Path(sys.executable).parent
+else:
+    _BASE_DIR = Path(__file__).parent
+
+ENV_PATH = _BASE_DIR / ".env"
 
 load_dotenv(ENV_PATH)
 

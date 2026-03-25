@@ -1,6 +1,7 @@
 import os
 import sys
 from datetime import date
+from pathlib import Path
 
 from dotenv import load_dotenv
 import shioaji as sj
@@ -8,7 +9,12 @@ import shioaji as sj
 from core import fetch_all_accounts, StockAccountData, FutoptAccountData, AllAccountsData
 from db import reconcile_previous_snapshot, save_snapshot
 
-load_dotenv()
+if getattr(sys, "frozen", False):
+    _BASE_DIR = Path(sys.executable).parent
+else:
+    _BASE_DIR = Path(__file__).parent
+
+load_dotenv(_BASE_DIR / ".env")
 
 DB_PATH = "account_history.db"
 

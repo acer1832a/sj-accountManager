@@ -1,7 +1,13 @@
 import sqlite3
+import sys
 from pathlib import Path
 
-DB_PATH = Path("account_history.db")
+if getattr(sys, "frozen", False):
+    _BASE_DIR = Path(sys.executable).parent
+else:
+    _BASE_DIR = Path(__file__).parent
+
+DB_PATH = _BASE_DIR / "account_history.db"
 
 
 def _connect() -> sqlite3.Connection:
