@@ -5,8 +5,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv, set_key
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QScrollArea,
@@ -76,7 +76,7 @@ def _bordered_dialog(dlg: "QDialog") -> QFrame:
 
 class _ApiTestWorker(QThread):
     """背景執行 Shioaji 登入測試。"""
-    result = pyqtSignal(bool, str)  # success, message
+    result = Signal(bool, str)  # success, message
 
     def __init__(self, api_key: str, secret_key: str) -> None:
         super().__init__()
@@ -297,7 +297,7 @@ class AboutDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         inner.addWidget(title)
 
-        app_version = "0.4.0"
+        app_version = "0.5.0"
         sj_version  = getattr(sj, "__version__", "未知")
         info = QLabel(f"版本：{app_version}\nShioaji 版本：{sj_version}")
         info.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -315,12 +315,8 @@ class AboutDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 def _save_all_snapshots(data: dict) -> None:
-    stock_accs = data["stock_accounts"]
-    # 取第一個股票帳戶的交易日作為共用快照日期，沒有則 fallback 到今天
-    snapshot_date = (
-        stock_accs[0]["snapshot_date"] if stock_accs else str(date.today())
-    )
-    for sa in stock_accs:
+    snapshot_date = data["snapshot_date"]
+    for sa in data["stock_accounts"]:
         save_snapshot({
             "date": sa["snapshot_date"],
             "account_id": sa["account_id"],
@@ -353,9 +349,9 @@ def _save_all_snapshots(data: dict) -> None:
 
 
 class FetchWorker(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(dict)
-    error    = pyqtSignal(str)
+    progress = Signal(str)
+    finished = Signal(dict)
+    error    = Signal(str)
 
     def __init__(self, api_key: str, secret_key: str):
         super().__init__()

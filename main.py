@@ -95,7 +95,7 @@ def show_account_status(api) -> None:
     fetch_positions = os.getenv("SHOW_STOCK_POSITIONS", "false").lower() == "true"
     data: AllAccountsData = fetch_all_accounts(api, fetch_names=fetch_positions)
     stock_accs = data["stock_accounts"]
-    snapshot_date = stock_accs[0]["snapshot_date"] if stock_accs else str(date.today())
+    snapshot_date = data["snapshot_date"]
 
     for sa in stock_accs:
         _print_stock_account(sa)

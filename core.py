@@ -31,6 +31,8 @@ class _RateLimiter:
 
 # Accounting API：25 次 / 5 秒
 _acct_limiter = _RateLimiter(25, 5.0)
+# Market Data API：50 次 / 5 秒
+_market_limiter = _RateLimiter(50, 5.0)
 
 
 class PositionRow(TypedDict):
@@ -71,6 +73,7 @@ class FutoptAccountData(TypedDict):
 class AllAccountsData(TypedDict):
     stock_accounts: list[StockAccountData]
     futopt_accounts: list[FutoptAccountData]
+    snapshot_date: str   # 最後交易日，供期貨快照使用
     cash_level: float
     total_assets: float
     cash_ratio: float
@@ -78,6 +81,23 @@ class AllAccountsData(TypedDict):
 
 def acc_label(acc) -> str:
     return f"{acc.broker_id}-{acc.account_id}"
+
+
+def fetch_last_trading_date(api: sj.Shioaji) -> str:
+    """透過 scanners 取得最後交易日日期（scan.date 為正確交易日，夜盤不會跨日錯位）。
+    若查詢失敗則 fallback 到今天。"""
+    try:
+        _market_limiter.wait()
+        result = api.scanners(
+            scanner_type=sj.constant.ScannerType.VolumeRank,
+            ascending=False,
+            count=1,
+        )
+        if result:
+            return result[0].date
+    except Exception:
+        pass
+    return str(date.today())
 
 
 def fetch_stock_account(api: sj.Shioaji, acc, fetch_names: bool = False) -> StockAccountData:
@@ -89,7 +109,13 @@ def fetch_stock_account(api: sj.Shioaji, acc, fetch_names: bool = False) -> Stoc
     stock_market_value = Decimal(0)
     for pos in positions_raw:
         shares = pos.quantity * 1000
-        market_value = Decimal(str(pos.last_price)) * shares
+        gross_value = Decimal(str(pos.last_price)) * shares
+        if pos.cond == "MarginTrading":
+            market_value = gross_value - Decimal(str(pos.margin_purchase_amount))
+        elif pos.cond == "ShortSelling":
+            market_value = Decimal(0)
+        else:
+            market_value = gross_value
         stock_market_value += market_value
         if fetch_names:
             contract = api.Contracts.Stocks.get(pos.code)
@@ -178,6 +204,12 @@ def fetch_all_accounts(api: sj.Shioaji, fetch_names: bool = False) -> AllAccount
     stock_accounts  = [fetch_stock_account(api, acc, fetch_names) for acc in stock_accs]
     futopt_accounts = [fetch_futopt_account(api, acc) for acc in futopt_accs]
 
+    # 決定快照日期：優先用股票帳戶的 T+0 交割日，否則透過 scanners 取最後交易日
+    if stock_accounts:
+        snapshot_date = stock_accounts[0]["snapshot_date"]
+    else:
+        snapshot_date = fetch_last_trading_date(api)
+
     total_cash     = Decimal(str(sum(sa["cash_balance"]     for sa in stock_accounts)))
     total_t1       = Decimal(str(sum(sa["settlement_t1"]   for sa in stock_accounts)))
     total_t2       = Decimal(str(sum(sa["settlement_t2"]   for sa in stock_accounts)))
@@ -189,6 +221,7 @@ def fetch_all_accounts(api: sj.Shioaji, fetch_names: bool = False) -> AllAccount
     return {
         "stock_accounts":  stock_accounts,
         "futopt_accounts": futopt_accounts,
+        "snapshot_date":   snapshot_date,
         "cash_level":   float(cash_level),
         "total_assets": float(total_assets),
         "cash_ratio":   cash_ratio,
